@@ -1,0 +1,209 @@
+#!/usr/bin/env groovy
+
+repoUrl = 'http://ubuntu:10080/root/frontend'
+
+version = null
+
+# --- BEGIN shared library ---
+def getGitBranch(defaultValue) {
+    branch = env.gitlabSourceBranch ?: env.gitlabBranch
+    return branch ?: defaultValue
+}
+
+
+def withGitCredentials(closure) {
+  withCredentials([usernamePassword(credentialsId: 'GITLAB', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
+    sh (script: "git config user.name '${GIT_USERNAME}'")
+    sh (script: 'git config user.email "admin@admin.es"')
+    sh (script: 'git config credential.helper \'/bin/bash -c "echo username=${GIT_USERNAME}\necho password=${GIT_PASSWORD}"\'')
+    if (closure)
+        closure.call()
+    sh (script: 'git config --unset credential.helper')
+  }
+}
+
+def gitMerge() {
+  if (env.gitlabSourceBranch && env.gitlabTargetBranch) {
+    git branch: env.gitlabTargetBranch, credentialsId: 'GITLAB', url: repoUrl
+    withGitCredentials {
+      sh "git merge origin/${env.gitlabSourceBranch.replace("'", "\\'")} --no-edit"
+    }
+  } else {
+    error 'EMPTY gitlabSourceBranch OR gitlabTargetBranch VARIABLES'
+  }
+}
+# --- END shared library ---
+
+
+
+pipeline {
+  agent any
+
+  triggers {
+    gitlab (triggerOnPush: true,
+           triggerOnMergeRequest: true,
+           triggerOnNoteRequest: true,
+           triggerOpenMergeRequestOnPush: 'never',
+           noteRegex: '/rebuild',
+           skipWorkInProgressMergeRequest: true,
+           ciSkip: true,
+           setBuildDescription: true,
+           addNoteOnMergeRequest: false,
+           addCiMessage: false,
+           addVoteOnMergeRequest: false,
+           acceptMergeRequestOnSuccess: false,
+           branchFilterType: 'NameBasedFilter',
+           includeBranchesSpec: 'master, develop',
+           excludeBranchesSpec: '',
+           secretToken: null)
+  }
+
+  parameters {
+    string(name: 'branch', defaultValue: 'master', description: 'Branch to build')
+    string(name: 'docker_registry', defaultValue: 'ubuntu::18081', description: 'Docker registry url')
+  }
+
+  environment {
+    GIT_BRANCH = getGitBranch(params.branch)
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        script {
+          if (env.gitlabMergeRequestId) {
+            gitMerge(repoUrl: repoUrl)
+          } else {
+            git branch: env.GIT_BRANCH, credentialsId: 'GITLAB', url: repoUrl
+          }
+        } 
+      }
+    }
+
+    stage('Install dependencies') {
+      steps {
+        sh 'npm install'
+      }
+    }
+
+    stage('Liter') {
+      steps {
+        sh 'npm run lint'
+      }
+    }
+
+    stage ('Unit tests') {
+      steps {
+        sh 'npm run unit' 
+        junit 'test/unit/junit.xml'
+       
+      }
+    }
+
+    stage ('E2E tests') {
+      steps {
+        sh 'npm run e2e'
+        junit 'test/e2e/reports/*.xml'
+      }
+    }
+
+    stage ('Build') {
+      when {
+        expression { !env.gitlabMergeRequestId }
+      }
+      steps {
+        script {
+          version = readFile 'version'
+          sh "docker build --no-cache -t frontend:${env.GIT_BRANCH}_${version} ."
+        }
+      }
+    }
+
+    stage ('Publish') {
+      when {
+        expression { env.GIT_BRANCH == 'master' }
+      }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+            sh "docker login -u ${DOCKER_USERNAME} -p ${DOCKER_PASSWORD} ${params.docker_registry}"
+        }
+        sh "docker tag frontend:${env.GIT_BRANCH}_${version} ${params.docker_registry}/frontend:${env.GIT_BRANCH}_{version}"
+        sh "docker push ${params.docker_registry}/frontend:${env.GIT_BRANCH}_{version}"
+      }
+    }
+
+    stage('Deploy to dev') {
+      when {
+        expression { env.GIT_BRANCH == 'master' }
+      }
+      steps {
+        build(job: 'DevOps/frontend_deploy',
+              parameters: [
+                string(name: 'version', value: version),
+                string(name: 'environment', value: 'dev'),
+                string(name: 'action', value: 'apply')
+              ],
+              propagate: true,
+              wait: true)
+      }
+    }
+
+    stage ('Tag & publish latest') {
+      when {
+        expression { env.GIT_BRANCH == 'master' }
+      }
+      steps {
+        sh "docker tag frontend:${env.GIT_BRANCH}_${version} ${params.docker_registry}/frontend:latest"
+        sh "docker push ${params.docker_registry}/frontend:latest"
+        sh "git tag frontend:${version}"
+        sh "git tag frontend:build_${BUILD_NUMBER}"
+        withGitCredentials {
+            sh "git push origin --tags" 	
+        }
+      }
+    }
+  }
+
+  post {
+    cleanup {
+      cleanWs()
+    }
+
+    success {
+      updateGitlabCommitStatus state: 'success'
+      script {
+        if (env.gitlabMergeRequestId){
+          addGitLabMRComment comment: ":heavy_check_mark: Build [${BUILD_NUMBER}](${BUILD_URL}) passed"  
+        } else {
+          if (env.GIT_BRANCH == 'master') {
+            // Trigger integration tests
+            build(job: 'DevOps/integration_tests',
+                  parameters: [
+                    string(name: 'frontend_version', value: version),
+                    string(name: 'backend_version', value: 'latest'),
+                  ],
+                  propagate: false,
+                  wait: false)
+          }
+        }
+      }
+    }
+
+    failure {
+      updateGitlabCommitStatus state: 'failed'
+      script {
+        if (env.gitlabMergeRequestId) {
+          addGitLabMRComment comment: ":x: Build [${BUILD_NUMBER}](${BUILD_URL}console) failed"
+        }
+      }
+    }
+
+    always {
+         emailext body: 'FRONTEND CI: version ${params.version} ${params.action} in ${params.environment} ${currentBuild.currentResult}',
+                  recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']],
+                  subject: 'FRONTEND CI'
+    }
+  }
+}
+
+

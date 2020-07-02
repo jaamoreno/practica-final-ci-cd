@@ -1,0 +1,75 @@
+#!/usr/bin/env groovy
+
+repoUrl = 'http://ubuntu:10080/root/integration'
+
+frontend_version = params.frontend_version == 'latest' ? 'latest' : "master_${params.frontend_version}"
+backend_version = params.backend_version == 'latest' ? 'latest' : "master_${params.backend_version}"
+service = ''
+version = ''
+
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'branch', defaultValue: 'master', description: 'Branch to build')
+    string(name: 'frontend_version', defaultValue: 'latest', description: 'Frontend version')
+    string(name: 'backend_version', defaultValue: 'latest', description: 'Backend version')
+    string(name: 'docker_registry', defaultValue: 'ubuntu::18081', description: 'Docker registry url')
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: params.branch, credentialsId: 'GITLAB', url: repoUrl
+      }
+    }
+
+    stage('Integration tests') {
+      environment {
+        FRONTEND_VERSION = "${frontend_version}"
+        BACKEND_VERSION = "${backend_version}"
+      }
+      steps {
+        sh 'docker-compose up --build --abort-on-container-exit'
+        junit 'reports/*.xml' 
+      }
+    }
+
+    stage('Publishing') {
+      when {
+        expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
+      }
+      steps {
+        script {
+          if (params.frontend_version != 'latest') {
+            service = 'frontend'
+            version = params.frontend_version
+          }
+          if (params.backend_version != 'latest') {
+            service = 'backend'
+            version = params.backend_version
+          }
+        }
+        withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+          sh "docker login -u ${DOCKER_USERNAME} -p ${DOCKER_PASSWORD} ${params.docker_registry}"
+          sh "docker pull ${params.docker_registry}/${service}:master_${version}"
+          sh "docker tag ${params.docker_registry}/${service}:master_${version} ${params.docker_registry}/${service}:${version}"
+          sh "docker push ${params.docker_registry}/${service}:${version}"
+        }
+      }
+    }
+  }
+
+  post {
+    cleanup {
+      cleanWs()
+    }
+
+    always {
+         emailext body: 'BACKEND: version ${params.version} ${params.action} in ${params.environment} ${currentBuild.currentResult}',
+                  recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']],
+                  subject: 'INTEGRATION TESTS'
+    }
+  }
+}
+

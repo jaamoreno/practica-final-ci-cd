@@ -1,0 +1,85 @@
+#!/usr/bin/env groovy
+
+httpStatusCode = 0
+
+pipeline {
+    agent any
+    
+    parameters {
+        string(name: 'version', defaultValue: '0.0.1', description: 'Flask app version')
+        choice(name: 'environment', choices: ['dev', 'sta', 'pro'], description: 'K8S environment')
+        choice(name: 'action', choices: ['apply', 'delete'], description: 'K8S action')
+    }
+    
+    environment {
+        DOCKER_REGISTRY = 'ubuntu::18081'
+    }
+    
+    stages {
+        stage('checkout') {
+            steps {
+                git branch: 'master', credentialsId: 'GITLAB', url: 'http://ubuntu:10080/root/frontend'
+            }
+        }
+        
+        stage('Prepare namespace') {
+            steps {
+                sh "kubectl describe namespace ${params.environment} || kubectl create namespace ${params.environment}"
+            }
+        }
+        
+        stage('Load image') {
+            steps {
+                sh "/usr/bin/kind load docker-image ${env.DOCKER_REGISTRY}/frontend:${params.version} --name kind"
+            }
+        }
+        
+        stage('Deploy to dev env') {
+            steps {
+                dir('k8s') {
+                    sh "VERSION=${params.version} envsubst < deployment.yml.tpl | kubectl -n ${params.environment} ${params.action} -f -"
+                    sh "kubectl -n ${params.environment} ${params.action} -f service.yml"
+                }
+            }
+        }
+        
+        stage('Validate environment') {
+            when {
+                expression { params.action == 'apply' }
+            }
+            steps {
+                retry(3) {
+                    script {
+                        def host = sh(script: 'kubectl get nodes -o jsonpath="{.items[0].status.addresses[0].address}"', returnStdout: true).trim()
+                        port = sh(script: "kubectl get -n ${params.environment} svc -l app=frontend -o jsonpath=i\"{.items[0].spec.ports[0].nodePort}\"", returnStdout: true).trim()
+                        httpStatusCode = sh(script: "curl -s -o /dev/null -w \"%{http_code}\" http://${host}:${port}/", returnStdout: true) 
+                    }
+                }
+                script {
+                    if (httpStatusCode != '200') {
+                        // Rollback: redeploy latest version
+                        // Note: it does not work in kind because frontend:latest does not exist. You must use a "real" kubernetes environment
+                        // or minikube, where kubernetes will be able to fetch frontend:latest image :) 
+                        dir('k8s') {
+                            sh "VERSION=latest envsubst < deployment.yml.tpl | kubectl -n ${params.environment} apply -f -"
+                            sh "kubectl -n ${params.environment} apply -f service.yml"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        cleanup {
+            cleanWs()
+        }
+
+        always {
+         emailext body: 'BACKEND: version ${params.version} ${params.action} in ${params.environment} ${currentBuild.currentResult}',
+                  recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']],
+                  subject: 'FRONTEND CD'
+        }
+    }
+}
+
